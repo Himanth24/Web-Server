@@ -1,11 +1,12 @@
 use std::{
     sync::{mpsc, Arc, Mutex},
+    panic::{ catch_unwind, AssertUnwindSafe},
     thread,
 };
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: mpsc::Sender<Option<Job>>,
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -14,7 +15,7 @@ impl ThreadPool {
     pub fn new(size: usize) -> Self {
         assert!(size > 0);
 
-        let (sender, receiver) = mpsc::channel::<Job>();
+        let (sender, receiver) = mpsc::channel::<Option<Job>>();
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(size);
 
@@ -30,23 +31,46 @@ impl ThreadPool {
         F: FnOnce() + Send + 'static, 
     {
         let job = Box::new(f);
-        self.sender.send(job).unwrap();
+        self.sender.send(Some(job)).unwrap();
+    }
+
+    pub fn shutdown(&mut self) {
+        for _ in &self.workers {
+            self.sender.send(None).unwrap();
+        }
+
+        for worker in &mut self.workers {
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+
+        println!("Thread pool shut down");
     }
 }
 
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Self {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Option<Job>>>>) -> Self {
         let thread = thread::spawn(move || loop {
             let job = receiver.lock().unwrap().recv().unwrap();
-            job();
+            match job {
+                Some(job) => {
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        job();
+                    }));
+                }
+                None => {
+                    break;
+                }
+            }
         });
 
-        Worker{ id, thread }
+        Worker{ id, thread: Some(thread) }
     }
 }
 
@@ -111,6 +135,19 @@ mod tests {
         // If run sequentially, this would take ~200ms. We check it finishes sooner.
         thread::sleep(Duration::from_millis(150));
         let elapsed = start_time.elapsed();
-        assert!(elapsed < Duration::from_millis(200));
+        assert!(elapsed < Duration::from_millis(160));
+    }
+
+    #[test]
+    fn test_shut_down() {
+        let mut pool = ThreadPool::new(2);
+        let start_time = std::time::Instant::now();
+
+        for _ in 0..2 {
+            pool.execute (|| {
+                thread::sleep(Duration::from_millis(100));
+            });
+        }
+        pool.shutdown();
     }
 }

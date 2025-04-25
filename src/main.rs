@@ -8,9 +8,12 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     thread,
+    sync::{Arc, Mutex},
 };
 
 use flate2::{write::GzEncoder, Compression};
+
+use ctrlc;
 
 struct Request {
     method: String,
@@ -207,17 +210,32 @@ fn handle_client(stream: TcpStream) {
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
-    let pool = ThreadPool::new(4);
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                pool.execute(|| {
-                    handle_client(stream);
-                })
-            }
-            Err(e) => {
-                eprintln!("Error: {}", e);
+    let pool = Arc::new(Mutex::new(ThreadPool::new(4)));
+
+    let pool_for_shutdown = Arc::clone(&pool);
+
+    ctrlc::set_handler(move || {
+        let mut pool = pool_for_shutdown.lock().unwrap();
+        pool.shutdown();
+        std::process::exit(0);
+    }).expect("Failed to set CTRL+C handler");
+
+    if let Err(err) = std::panic::catch_unwind(|| {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let pool = Arc::clone(&pool);
+                    pool.lock().unwrap().execute(|| {
+                        handle_client(stream);
+                    });
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                }
             }
         }
+    }){
+        eprintln!("Main thread panicked: {:?}", err);
+        pool.lock().unwrap().shutdown();
     }
 }
