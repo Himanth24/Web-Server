@@ -3,12 +3,7 @@ mod thread_pool;
 use thread_pool::ThreadPool;
 
 use std::{
-    env,
-    fs,
-    io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
-    thread,
-    sync::{Arc, Mutex},
+    env, fmt::format, fs, io::{BufRead, BufReader, Read, Write}, net::{TcpListener, TcpStream}, sync::{Arc, Mutex}, thread
 };
 
 use flate2::{write::GzEncoder, Compression};
@@ -114,8 +109,55 @@ fn handle_client(stream: TcpStream) {
     match method {
         "GET" => {
             if request.path == "/" {
-                let mut stream = reader.into_inner();
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+                let file_path = "public/index.html";
+                match fs::read(&file_path) {
+                    Ok(contents) => {
+                        let content_type = mime_guess::from_path(&file_path)
+                            .first_or_octet_stream()
+                            .essence_str()
+                            .to_string();
+                        let accept_encoding = request.get_header("accept-encoding");
+                        let mut stream = reader.into_inner();
+                        respond_with_body(
+                            &mut stream,
+                            &content_type,
+                            &contents,
+                            &accept_encoding,
+                        );
+                    }
+                    Err(err) => {
+                        let mut stream = reader.into_inner();
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n");
+                    }
+                }
+
+                return;
+            }
+
+            if request.path.starts_with("/public/") {
+                let file_name = request.path.replacen("/public/", "", 1);
+                let file_path = format!("public/{}",file_name);
+                match fs::read(&file_path) {
+                    Ok(contents) => {
+                        let content_type = mime_guess::from_path(&file_path)
+                            .first_or_octet_stream()
+                            .essence_str()
+                            .to_string();
+                        let accept_encoding = request.get_header("accept-encoding");
+                        let mut stream = reader.into_inner();
+                        respond_with_body(
+                            &mut stream, 
+                            &content_type, 
+                            &contents, 
+                            &accept_encoding
+                        );
+                    }
+                    Err(err) => {
+                        let mut stream = reader.into_inner();
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n");
+                    }
+                }
+
                 return;
             }
 
