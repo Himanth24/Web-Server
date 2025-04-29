@@ -6,7 +6,12 @@ use std::{
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Option<Job>>,
+    sender: Option<mpsc::Sender<Message>>,
+}
+
+enum Message {
+    NewJob(Job),
+    Terminate,
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -15,37 +20,71 @@ impl ThreadPool {
     pub fn new(size: usize) -> Self {
         assert!(size > 0);
 
-        let (sender, receiver) = mpsc::channel::<Option<Job>>();
+        let (sender, receiver) = mpsc::channel::<Message>();
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(size);
 
         for id in 0..size {
-            workers.push(Worker::new(id,Arc::clone(&receiver)));
+            workers.push(Worker::new(id, Arc::clone(&receiver)));
         }
 
-        ThreadPool { workers, sender }
+        ThreadPool { 
+            workers, 
+            sender: Some(sender),
+        }
     }
 
-    pub fn execute<F>(&self, f:F) 
-    where 
-        F: FnOnce() + Send + 'static, 
+    pub fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
     {
         let job = Box::new(f);
-        self.sender.send(Some(job)).unwrap();
+        
+        if let Some(sender) = &self.sender {
+            sender.send(Message::NewJob(job)).unwrap_or_else(|e| {
+                eprintln!("Error sending job to worker: {}", e);
+            });
+        } else {
+            eprintln!("Cannot execute job: thread pool is shutting down");
+        }
     }
 
     pub fn shutdown(&mut self) {
-        for _ in &self.workers {
-            self.sender.send(None).unwrap();
-        }
-
-        for worker in &mut self.workers {
-            if let Some(thread) = worker.thread.take() {
-                thread.join().unwrap();
+        println!("Shutting down thread pool...");
+        
+        // Take ownership of sender, which will cause it to be dropped when this function ends
+        if let Some(sender) = self.sender.take() {
+            // Send terminate message to all workers
+            for _ in &self.workers {
+                sender.send(Message::Terminate).unwrap_or_else(|_| {
+                    eprintln!("Error sending terminate message to worker");
+                });
             }
+            
+            // Drop the sender to close the channel
+            drop(sender);
+            
+            // Join all worker threads
+            for worker in &mut self.workers {
+                println!("Shutting down worker {}", worker.id);
+                if let Some(thread) = worker.thread.take() {
+                    thread.join().unwrap_or_else(|e| {
+                        eprintln!("Error joining worker thread {}: {:?}", worker.id, e);
+                    });
+                }
+            }
+            
+            println!("Thread pool shut down complete");
         }
+    }
+}
 
-        println!("Thread pool shut down");
+// Implement Drop to ensure proper cleanup when ThreadPool is dropped
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        if self.sender.is_some() {
+            self.shutdown();
+        }
     }
 }
 
@@ -55,25 +94,51 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Option<Job>>>>) -> Self {
-        let thread = thread::spawn(move || loop {
-            let job = receiver.lock().unwrap().recv().unwrap();
-            match job {
-                Some(job) => {
-                    let _ = catch_unwind(AssertUnwindSafe(|| {
-                        job();
-                    }));
-                }
-                None => {
-                    break;
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Self {
+        let thread = thread::spawn(move || {
+            loop {
+                // Use a block to ensure the lock is released after receiving a message
+                let message = {
+                    let receiver_lock = receiver.lock().unwrap_or_else(|e| {
+                        eprintln!("Worker {} failed to lock receiver: {:?}", id, e);
+                        e.into_inner()
+                    });
+                    
+                    match receiver_lock.recv() {
+                        Ok(message) => message,
+                        Err(e) => {
+                            eprintln!("Worker {} disconnected: {}", id, e);
+                            break;
+                        }
+                    }
+                };
+
+                match message {
+                    Message::NewJob(job) => {
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            job();
+                        }));
+                        
+                        if let Err(e) = result {
+                            eprintln!("Worker {} panicked while executing job: {:?}", id, e);
+                        }
+                    }
+                    Message::Terminate => {
+                        println!("Worker {} received terminate message", id);
+                        break;
+                    }
                 }
             }
+            
+            println!("Worker {} shutting down", id);
         });
 
-        Worker{ id, thread: Some(thread) }
+        Worker { 
+            id, 
+            thread: Some(thread),
+        }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -141,8 +206,6 @@ mod tests {
     #[test]
     fn test_shut_down() {
         let mut pool = ThreadPool::new(2);
-        let start_time = std::time::Instant::now();
-
         for _ in 0..2 {
             pool.execute (|| {
                 thread::sleep(Duration::from_millis(100));
