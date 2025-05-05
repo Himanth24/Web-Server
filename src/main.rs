@@ -6,8 +6,11 @@ use std::{
     env, fs, io::{self, ErrorKind, BufRead, BufReader, Read, Write}, 
     net::{self, TcpListener, TcpStream}, 
     sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, 
-    thread, time::Duration
+    thread, time::Duration,
+    collections::HashMap
 };
+
+
 
 use flate2::{write::GzEncoder, Compression};
 
@@ -17,6 +20,7 @@ struct Request {
     version: String,
     headers: Vec<String>,
     body: Option<Vec<u8>>,
+    query_params: HashMap<String,String>
 }
 
 impl Request {
@@ -45,12 +49,16 @@ impl Request {
             ));
         }
 
+        let full_path = request_line_data[1];
+        let (path, query_params) = parse_query_params(full_path);
+
         let mut request = Request {
             method: request_line_data.get(0).unwrap_or(&"").to_string(),
-            path: request_line_data.get(1).unwrap_or(&"").to_string(),
+            path: path.to_string(),
             version: request_line_data.get(2).unwrap_or(&"").to_string(),
             headers,
             body: None,
+            query_params,
         };
 
         let content_length: usize = request.get_header("content-length").parse().unwrap_or(0);
@@ -59,6 +67,10 @@ impl Request {
 
         request.body = Some(body);
         Ok(request)
+    }
+
+    fn get_query(&self, key: &str) -> Option<&String> {
+        self.query_params.get(key)
     }
 
     fn get_header(self: &Self, _target_header: &str) -> String{
@@ -84,11 +96,29 @@ impl Request {
     }
 }
 
+fn parse_query_params(full_path: &str) -> (&str, HashMap<String,String>){
+    let parts:Vec<&str> = full_path.splitn(2,"?").collect();
+    let path = parts[0];
+
+    let mut query_map: HashMap<String,String> = HashMap::new();
+    if(parts.len() == 2) {
+        let query_str = parts[1];
+        for pair in query_str.split('&') {
+            let mut kv = pair.splitn(2,'=');
+            if let (Some(k), Some(v)) =  (kv.next(), kv.next()){
+                query_map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    (path, query_map)
+}
+
 fn respond_with_body(
     stream: &mut TcpStream,
     content_type: &str,
     body: &[u8],
     accept_encoding: &str,
+    extra_headers: Option<HashMap<&str, &str>>
 ) {
     let (encoded_body, encoding_header): (Vec<u8>, String) = if accept_encoding.contains("gzip") {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -99,12 +129,20 @@ fn respond_with_body(
         (body.to_vec(), "".to_string())
     };
 
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\n{}Content-Length: {}\r\n\r\n",
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\n{}Content-Length: {}\r\n",
         content_type,
         encoding_header,
         encoded_body.len()
     );
+
+    if let Some(map) = extra_headers {
+        for (k, v) in map {
+            response.push_str(&format!("{}: {}\r\n",k,v));
+        }
+    }
+
+    response.push_str("\r\n");
     
     if let Err(e) = stream.write_all(response.as_bytes()) {
         eprintln!("Error writing response header: {}", e);
@@ -178,6 +216,7 @@ fn handle_client(mut stream: TcpStream) {
                                 &content_type,
                                 &contents,
                                 &accept_encoding,
+                                None
                             );
                         }
                         Err(e) => {
@@ -205,7 +244,8 @@ fn handle_client(mut stream: TcpStream) {
                                 &mut stream, 
                                 &content_type, 
                                 &contents, 
-                                &accept_encoding
+                                &accept_encoding,
+                                None
                             );
                         }
                         Err(e) => {
@@ -226,6 +266,17 @@ fn handle_client(mut stream: TcpStream) {
                     return;
                 }
 
+
+                if request.path.starts_with("/search"){
+                    let lang = request.get_query("lang").unwrap();
+                    let q = request.get_query("q").unwrap();
+                    let accept_encoding = &request.get_header("accept-encoding");
+                    let mut stream = reader.into_inner();
+                    let body = format!("{} {}",q, lang);
+                    respond_with_body(stream, "text/plain", body.as_bytes(), accept_encoding,None);
+                    return ;
+                }
+
                 if request.path.starts_with("/echo/") {
                     let echo_text = request.path.replacen("/echo/", "", 1);
                     let accept_encoding = request.get_header("accept-encoding");
@@ -236,7 +287,19 @@ fn handle_client(mut stream: TcpStream) {
                         "text/plain",
                         echo_text.as_bytes(),
                         &accept_encoding,
+                        None
                     );
+                    return;
+                }
+
+                if request.path == "/custom-header" {
+                    let mut headers = HashMap::new();
+                    headers.insert("X-Powered-By", "Rust Web Server");
+                    headers.insert("Cache-Control", "no-cache");
+                    let accept_encoding = request.get_header("accept-encoding");
+                    let mut stream = reader.into_inner();
+
+                    respond_with_body(&mut stream, "text/plain", b"This response has custom headers", &accept_encoding, Some(headers));
                     return;
                 }
 
@@ -250,6 +313,7 @@ fn handle_client(mut stream: TcpStream) {
                         "text/plain",
                         user_agent.as_bytes(),
                         &accept_encoding,
+                        None
                     );
                     return;
                 }
@@ -275,6 +339,7 @@ fn handle_client(mut stream: TcpStream) {
                                 "application/octet-stream",
                                 &contents,
                                 &accept_encoding,
+                                None
                             );
                         }
                         Err(e) => {
