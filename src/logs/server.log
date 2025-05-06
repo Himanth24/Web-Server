@@ -1,0 +1,2 @@
+[2025-05-06 13:14:08] HEAD /custom-header HTTP/1.1 from 127.0.0.1:54390
+[2025-05-06 13:14:08] HEAD /custom-header HTTP/1.1 200 OK from 127.0.0.1:54390

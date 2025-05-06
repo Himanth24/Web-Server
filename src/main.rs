@@ -10,7 +10,7 @@ use std::{
     collections::HashMap
 };
 
-
+use chrono::Local;
 
 use flate2::{write::GzEncoder, Compression};
 
@@ -22,6 +22,13 @@ struct Request {
     body: Option<Vec<u8>>,
     query_params: HashMap<String,String>
 }
+
+struct Route {
+    method: &'static str,
+    path: &'static str,
+    handler: fn(Request, &mut TcpStream),
+}
+//TO-DO
 
 impl Request {
     fn new(reader: &mut BufReader<&mut TcpStream>) -> Result<Self, std::io::Error> {
@@ -115,10 +122,15 @@ fn parse_query_params(full_path: &str) -> (&str, HashMap<String,String>){
 
 fn respond_with_body(
     stream: &mut TcpStream,
+    status_code: &str,
+    status_message: &str,
     content_type: &str,
     body: &[u8],
     accept_encoding: &str,
-    extra_headers: Option<HashMap<&str, &str>>
+    extra_headers: Option<HashMap<&str, &str>>,
+    send_body: bool,
+    request: &Request,
+    peer_address: &str
 ) {
     let (encoded_body, encoding_header): (Vec<u8>, String) = if accept_encoding.contains("gzip") {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -130,11 +142,18 @@ fn respond_with_body(
     };
 
     let mut response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\n{}Content-Length: {}\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{}Content-Length: {}\r\n",
+        status_code,
+        status_message,
         content_type,
         encoding_header,
         encoded_body.len()
     );
+
+    let path = request.path.to_string();
+    let method = request.method.to_string();
+    let verion = request.version.to_string();
+    log_responses(status_code,status_message,&path,&method,&verion,&peer_address);
 
     if let Some(map) = extra_headers {
         for (k, v) in map {
@@ -149,9 +168,11 @@ fn respond_with_body(
         return;
     }
     
-    if let Err(e) = stream.write_all(&encoded_body) {
-        eprintln!("Error writing response body: {}", e);
-        return;
+    if send_body {
+        if let Err(e) = stream.write_all(&encoded_body) {
+            eprintln!("Error writing response body: {}", e);
+            return;
+        }
     }
     
     // Ensure the data is sent immediately
@@ -165,22 +186,41 @@ fn respond_with_body(
     }
 }
 
+fn log_requests(request: &Request, peer_address: &str){
+    let timestamp = Local::now();
+    let log = format!("[{}] {} {} {} from {}\n", timestamp.format("%Y-%m-%d %H:%M:%S"), request.method, request.path, request.version.trim(), peer_address);
+    if let Ok(mut File) = fs::OpenOptions::new().create(true).append(true).open("src/logs/server.log") {
+        let _ = File.write_all(log.as_bytes());
+    }
+}
+
+fn log_responses(status_code: &str,status_message: &str,request_path: &str, request_method: &str, request_version: &str, peer_address: &str){
+    let timestamp = Local::now();
+    let log = format!("[{}] {} {} {} {} {} from {}\n", timestamp.format("%Y-%m-%d %H:%M:%S"), request_method, request_path, request_version.trim(), status_code, status_message, peer_address);
+    if let Ok(mut File) = fs::OpenOptions::new().create(true).append(true).open("src/logs/server.log") {
+        let _ = File.write_all(log.as_bytes());
+    }
+}
+
 fn handle_client(mut stream: TcpStream) {
     // Set socket options for quick cleanup
     if let Err(e) = stream.set_nodelay(true) {
         eprintln!("Failed to set TCP_NODELAY: {}", e);
     }
     
-    if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(5))) {
+    if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(30))) {
         eprintln!("Failed to set read timeout: {}", e);
     }
     
     if let Err(e) = stream.set_write_timeout(Some(std::time::Duration::from_secs(30))) {
         eprintln!("Failed to set write timeout: {}", e);
     }
-    
+    let mut ip_address =String::from("").to_string();
     match stream.peer_addr() {
-        Ok(addr) => println!("Accepted new connection from {}", addr),
+        Ok(addr) => {
+            ip_address = addr.to_string();
+            println!("Accepted new connection from {}", addr)
+        },
         Err(e) => eprintln!("Failed to get peer address: {}", e),
     }
     
@@ -198,9 +238,12 @@ fn handle_client(mut stream: TcpStream) {
             }
         };
         let method = request.method.as_str();
+        let peer_address = ip_address.to_string();
+        log_requests(&request, &peer_address);
 
         match method {
-            "GET" => {
+            "GET" | "HEAD" => {
+                let send_body = method == "GET";
                 if request.path == "/" {
                     let file_path = "public/index.html";
                     match fs::read(&file_path) {
@@ -213,10 +256,15 @@ fn handle_client(mut stream: TcpStream) {
                             let mut stream = reader.into_inner();
                             respond_with_body(
                                 &mut stream,
+                                "200",
+                                "OK",
                                 &content_type,
                                 &contents,
                                 &accept_encoding,
-                                None
+                                None,
+                                send_body,
+                                &request,
+                                &peer_address
                             );
                         }
                         Err(e) => {
@@ -242,10 +290,15 @@ fn handle_client(mut stream: TcpStream) {
                             let mut stream = reader.into_inner();
                             respond_with_body(
                                 &mut stream, 
+                                "200",
+                                "OK",
                                 &content_type, 
                                 &contents, 
                                 &accept_encoding,
-                                None
+                                None,
+                                send_body,
+                                &request,
+                                &peer_address
                             );
                         }
                         Err(e) => {
@@ -273,7 +326,15 @@ fn handle_client(mut stream: TcpStream) {
                     let accept_encoding = &request.get_header("accept-encoding");
                     let mut stream = reader.into_inner();
                     let body = format!("{} {}",q, lang);
-                    respond_with_body(stream, "text/plain", body.as_bytes(), accept_encoding,None);
+                    respond_with_body(stream, "200","OK","text/plain", body.as_bytes(), accept_encoding,None,send_body,&request, &peer_address);
+                    return ;
+                }
+
+                if request.path == "/status-demo" {
+                    let accept_encoding = &request.get_header("accept-encoding");
+                    let mut extra_headers = Some(HashMap::from([("X-DEMO","true")]));
+                    let mut stream = reader.into_inner();
+                    respond_with_body(stream, "411", "This is a status message", "text/plain", b"This is a status code response", accept_encoding, extra_headers,send_body,&request,&peer_address);
                     return ;
                 }
 
@@ -284,10 +345,15 @@ fn handle_client(mut stream: TcpStream) {
 
                     respond_with_body(
                         &mut stream,
+                        "200",
+                        "OK",
                         "text/plain",
                         echo_text.as_bytes(),
                         &accept_encoding,
-                        None
+                        None,
+                        send_body,
+                        &request,
+                        &peer_address
                     );
                     return;
                 }
@@ -299,7 +365,7 @@ fn handle_client(mut stream: TcpStream) {
                     let accept_encoding = request.get_header("accept-encoding");
                     let mut stream = reader.into_inner();
 
-                    respond_with_body(&mut stream, "text/plain", b"This response has custom headers", &accept_encoding, Some(headers));
+                    respond_with_body(&mut stream, "200","OK","text/plain", b"This response has custom headers", &accept_encoding, Some(headers),send_body,&request,&peer_address);
                     return;
                 }
 
@@ -310,10 +376,15 @@ fn handle_client(mut stream: TcpStream) {
 
                     respond_with_body(
                         &mut stream,
+                        "200",
+                        "OK",
                         "text/plain",
                         user_agent.as_bytes(),
                         &accept_encoding,
-                        None
+                        None,
+                        send_body,
+                        &request,
+                        &peer_address
                     );
                     return;
                 }
@@ -336,10 +407,15 @@ fn handle_client(mut stream: TcpStream) {
                             let mut stream = reader.into_inner();
                             respond_with_body(
                                 &mut stream,
+                                "200",
+                                "OK",
                                 "application/octet-stream",
                                 &contents,
                                 &accept_encoding,
-                                None
+                                None,
+                                send_body,
+                                &request,
+                                &peer_address
                             );
                         }
                         Err(e) => {
